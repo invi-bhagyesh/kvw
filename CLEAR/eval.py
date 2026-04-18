@@ -23,7 +23,7 @@ def str2bool(v):
     else:
         raise argparse.ArgumentTypeError('Boolean value expected.')
 
-def eval_classification(model, processor, data_path,with_options):
+def eval_classification(model, processor, data_path,with_options, per_sample_log=None):
     print("################################## Classification Task Starts ##############################################")
     print(f"############################## Evaluating {data_path} Mode, with_options={with_options} #########################################" )
     if "forget" in data_path:
@@ -59,21 +59,31 @@ def eval_classification(model, processor, data_path,with_options):
         assistant_response = re.sub(r'[^a-zA-Z0-9]', '', generated_text)
         print("Generated text is : \n","**************\n",generated_text,"\n**************")
 
+        sample_correct = False
         if not with_options: # answer in response is okay
-            answer = re.sub(r'[^a-zA-Z0-9]', '', answer)
-            if answer.lower() in assistant_response.lower():
+            answer_stripped = re.sub(r'[^a-zA-Z0-9]', '', answer)
+            if answer_stripped.lower() in assistant_response.lower():
                 print("Correct Answer!")
                 correct_count+=1
+                sample_correct = True
             else:
-                print(f"Wrong Answer! ${assistant_response}$ doesn't include ${answer}$")
+                print(f"Wrong Answer! ${assistant_response}$ doesn't include ${answer_stripped}$")
         else: # string matching
             predicted_answer = assistant_response[0].upper() if assistant_response and assistant_response[0].upper() else None
             modified_answer = re.sub(r'[^a-zA-Z0-9]', '', answer)
             if predicted_answer==correct_answer or modified_answer.lower() in assistant_response.lower():
                 print("Correct Answer!")
                 correct_count+=1
+                sample_correct = True
             else:
                 print(f"Wrong Answer! ${predicted_answer}$ != ${correct_answer}$. {answer}")
+        if per_sample_log is not None:
+            per_sample_log.append({
+                "idx": idx,
+                "name": str(answer),
+                "generated": generated_text,
+                "correct": bool(sample_correct),
+            })
         print("##################################")
         VQA_num+=1
     
@@ -213,9 +223,15 @@ def main():
     # Evaluate Forget Set (from shared classification and generation folders)
     torch.cuda.empty_cache()
     results_data={}
+    forget_per_sample_log = []
     if "forget" in args.eval_list:
         print("### Evaluating Forget Set ###")
-        forget_classification_result = eval_classification(model=model, processor=processor, data_path=f"{args.data_folder}/{args.forget_cls_folder}",with_options=False)
+        forget_classification_result = eval_classification(
+            model=model, processor=processor,
+            data_path=f"{args.data_folder}/{args.forget_cls_folder}",
+            with_options=False,
+            per_sample_log=forget_per_sample_log,
+        )
 
         results_data["Forget Set Results"]={
             "classification": forget_classification_result,
@@ -267,6 +283,12 @@ def main():
 
     with open(f'{args.output_folder}/evalconfig.json', 'w', encoding='utf-8') as f:
         json.dump(vars(args), f, ensure_ascii=False, indent=4)
+
+    if forget_per_sample_log:
+        per_sample_file = f'{args.output_folder}/forget_per_sample.json'
+        with open(per_sample_file, 'w', encoding='utf-8') as f:
+            json.dump(forget_per_sample_log, f, ensure_ascii=False, indent=2)
+        print(f"Per-sample forget eval saved to {per_sample_file}")
 
 
 if __name__ == "__main__":
