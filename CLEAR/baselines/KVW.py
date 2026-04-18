@@ -271,6 +271,99 @@ def compute_knowledge_coeffs(
 
     return kc_list
 
+@torch.no_grad()
+def compute_knowledge_coeffs_per_sample(model, dataloader, eps=1e-12):
+    """
+    Like compute_knowledge_coeffs but keeps the batch axis, producing a KC
+    tensor per forget sample. Returns list over layers; each element is
+    [N_total, d_ff] where N_total is the sum of batch sizes across the loader.
+    Row i corresponds to the i-th sample in iteration order.
+    """
+    model.eval()
+    layers = _get_decoder_layers(model)
+    n_layers = len(layers)
+
+    coeff_rows = [[] for _ in range(n_layers)]
+    token_counts_rows = [[] for _ in range(n_layers)]
+    current = {"attention_mask": None, "answer_mask": None}
+
+    def make_hook(layer_idx):
+        def hook(module, inputs, output):
+            coeff = inputs[0]                                # [B, T, d_ff]
+            coeff = coeff.to(torch.float32).abs()
+            coeff = torch.nan_to_num(coeff, nan=0.0, posinf=0.0, neginf=0.0)
+
+            attn_mask = current["attention_mask"].to(coeff.device)
+            ans_mask = current["answer_mask"].to(coeff.device)
+            mask = attn_mask.bool() & ans_mask               # [B, T] bool
+
+            mask_f = mask.unsqueeze(-1).to(coeff.dtype)      # [B, T, 1]
+            summed = (coeff * mask_f).sum(dim=1).detach().cpu()   # [B, d_ff]
+            counts = mask.sum(dim=1).detach().cpu().to(torch.float32)  # [B]
+
+            coeff_rows[layer_idx].append(summed)
+            token_counts_rows[layer_idx].append(counts)
+        return hook
+
+    hooks = [layer.mlp.down_proj.register_forward_hook(make_hook(l))
+             for l, layer in enumerate(layers)]
+
+    for batch in tqdm(dataloader, desc="Computing per-sample KC"):
+        if isinstance(batch, dict):
+            attention_mask = batch["attention_mask"]
+            labels = batch.get("labels", None)
+        elif isinstance(batch, (list, tuple)):
+            attention_mask = batch[1]
+            labels = batch[4] if len(batch) >= 5 else batch[3]
+        else:
+            raise TypeError(f"Unsupported batch type: {type(batch)}")
+
+        current["attention_mask"] = attention_mask
+        cause_mask = torch.zeros_like(labels, dtype=torch.bool)
+        cause_mask[:, :-1] = (labels[:, 1:] != -100)
+        current["answer_mask"] = cause_mask
+
+        _ = model(**batch)
+
+    for h in hooks:
+        h.remove()
+
+    kc_list = []
+    for l in range(n_layers):
+        if not coeff_rows[l]:
+            kc_list.append(torch.zeros(0, 1))
+            continue
+        sums = torch.cat(coeff_rows[l], dim=0)               # [N, d_ff]
+        counts = torch.cat(token_counts_rows[l], dim=0)      # [N]
+        counts = counts.clamp(min=eps).unsqueeze(-1)          # [N, 1]
+        kc = sums / counts
+        kc = torch.nan_to_num(kc, nan=0.0, posinf=0.0, neginf=0.0)
+        kc_list.append(kc)
+
+    return kc_list
+
+
+def residual_redundancy_per_sample(kc_f_per_sample, kc_r_list,
+                                   start_layer, end_layer, eps=1e-12):
+    """
+    r_i = sum over layers in [start_layer, end_layer]
+          sum over neurons
+          max(log KC_f_i,l[j] - log KC_r_l[j], 0)
+    Returns tensor of shape [N].
+    """
+    N = kc_f_per_sample[0].shape[0]
+    r = torch.zeros(N, dtype=torch.float32)
+    for l, (kf, kr) in enumerate(zip(kc_f_per_sample, kc_r_list)):
+        if l < start_layer or l > end_layer:
+            continue
+        kf = kf.to(torch.float32)
+        kr = kr.to(torch.float32).unsqueeze(0)               # [1, d_ff]
+        delta = torch.log(kf + eps) - torch.log(kr + eps)    # [N, d_ff]
+        delta = torch.clamp(delta, min=0.0)
+        r += delta.sum(dim=1)
+    return r
+
+
 def build_knowledge_ratio_gates(kc_f_list, kc_r_list, gamma, eps=1e-12):
     gates = []
 
@@ -376,6 +469,46 @@ def main(args):
         return
 
     kc_r = torch.load(f"kc/kc_r_retain_{100 - args.forget_ratio:02}.pt")
+
+    if args.phase == 'stage_a_measure':
+        # Load the already-weakened model (passed via --vanilla_dir) and
+        # compute per-sample residual redundancy r_i.
+        # Uses a non-shuffled loader so names in forget_df line up with r rows.
+        stageA_loader = DataLoader(
+            multimodal_forget_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            collate_fn=lambda x: train_collate_function(x, processor, device, True)
+        )
+        # Collect sample names in the same order the dataloader will iterate.
+        # CLEAR_Dataset processes forget_df row-by-row with no reordering, so
+        # names taken straight from forget_df match DataLoader(shuffle=False).
+        names = [str(s.get("name", "")) for s in forget_df]
+        assert len(names) == len(multimodal_forget_dataset), (
+            f"name list ({len(names)}) != processed dataset ({len(multimodal_forget_dataset)})"
+        )
+
+        kc_f_per = compute_knowledge_coeffs_per_sample(model, stageA_loader)
+        r = residual_redundancy_per_sample(
+            kc_f_per, kc_r, args.start_layer, args.end_layer
+        )
+        assert r.numel() == len(names), (
+            f"r has {r.numel()} entries but we have {len(names)} names — ordering mismatch"
+        )
+
+        os.makedirs("kc", exist_ok=True)
+        out_path = f"kc/r_stageA_forget{args.forget_ratio:02}.pt"
+        torch.save(
+            {
+                "r": r,
+                "names": names,
+                "start_layer": args.start_layer,
+                "end_layer": args.end_layer,
+            },
+            out_path,
+        )
+        print(f"r_i saved to {out_path}  (N={r.numel()})")
+        return
     for epoch in range(args.num_epochs):
         train_data_forget = enumerate(train_dataloader_forget)
         for iter in tqdm(range(0, n_iters)):
