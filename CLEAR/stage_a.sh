@@ -14,9 +14,20 @@ set -euo pipefail
 MODEL_ID="Qwen/Qwen2-VL-2B-Instruct"
 WEAKENED_DIR="checkpoints/KVW_05"
 FORGET_RATIO=5
+RETAIN_RATIO=$((100 - FORGET_RATIO))
+FORGET_STR=$(printf '%02d' ${FORGET_RATIO})
+RETAIN_STR=$(printf '%02d' ${RETAIN_RATIO})
 START_LAYER=1
 END_LAYER=25
-OUTDIR="outputs/stage_a_forget05"
+OUTDIR="outputs/stage_a_forget${FORGET_STR}"
+
+# Folder names align with eval.sh in this repo.
+FORGET_CLS_FOLDER="forget${FORGET_STR}_perturbed"
+FORGET_GEN_FOLDER="forget${FORGET_STR}+tofu"
+RETAIN_CLS_FOLDER="retain_perturbed"
+RETAIN_GEN_FOLDER="retain${RETAIN_STR}+tofu"
+REALFACE_FOLDER="real_faces"
+REALWORLD_FOLDER="real_world"
 
 mkdir -p "${OUTDIR}"
 
@@ -38,19 +49,19 @@ CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0} python3 eval.py \
     --model_id "${MODEL_ID}" \
     --cache_path "${WEAKENED_DIR}" \
     --data_folder data/CLEAR \
-    --forget_cls_folder "forget${FORGET_RATIO:-5}_classification" \
-    --forget_gen_folder "forget${FORGET_RATIO:-5}_generation" \
-    --retain_cls_folder "retain$(printf '%02d' $((100-FORGET_RATIO)))_classification" \
-    --retain_gen_folder "retain$(printf '%02d' $((100-FORGET_RATIO)))_generation" \
-    --realface_folder "real_face" \
-    --realworld_folder "real_world" \
+    --forget_cls_folder "${FORGET_CLS_FOLDER}" \
+    --forget_gen_folder "${FORGET_GEN_FOLDER}" \
+    --retain_cls_folder "${RETAIN_CLS_FOLDER}" \
+    --retain_gen_folder "${RETAIN_GEN_FOLDER}" \
+    --realface_folder "${REALFACE_FOLDER}" \
+    --realworld_folder "${REALWORLD_FOLDER}" \
     --output_folder "${OUTDIR}/eval" \
     --eval_list "forget" \
-    --shot_num zero
+    --shot_num zero_shots
 
 echo "=== Step 3/3: analysis ==="
 python3 ../scripts/stage_a_analysis.py \
-    --r-path "kc/r_stageA_forget$(printf '%02d' ${FORGET_RATIO}).pt" \
+    --r-path "kc/r_stageA_forget${FORGET_STR}.pt" \
     --eval-path "${OUTDIR}/eval/forget_per_sample.json" \
     --output-dir "${OUTDIR}/analysis"
 
