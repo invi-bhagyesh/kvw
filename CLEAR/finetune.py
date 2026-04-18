@@ -206,15 +206,12 @@ def main(args):
         progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch + 1}")
         if args.gradient_accumulation:
             for step, batch in enumerate(progress_bar):
-                input_ids, attention_mask, pixel_values, labels = batch
                 with accelerator.accumulate(model):
-                    outputs = model(input_ids=input_ids, attention_mask=attention_mask,
-                                    pixel_values=pixel_values, labels=labels)
+                    outputs = model(**batch)
                     loss = outputs.loss / accumulation_steps
-                    # loss = outputs.loss
                     accelerator.backward(loss)
                     if (step + 1) % accumulation_steps == 0:
-                        accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)  #
+                        accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
                         optimizer.step()
                         optimizer.zero_grad()
                         lr_scheduler.step()
